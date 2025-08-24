@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+psycopg[binary]
+sentence-transformers
+numpy
+requests
+pydantic
