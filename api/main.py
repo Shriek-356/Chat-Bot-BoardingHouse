@@ -42,6 +42,7 @@ class Search(BaseModel):
     amenities: Optional[List[str]] = None
     targets: Optional[List[str]] = None
     env_types: Optional[List[str]] = None
+    keywords: Optional[List[str]] = None
     limit: int = 10
     page: int = 1
     semantic_query: Optional[str] = None
@@ -126,7 +127,6 @@ def _find_one(cands: List[str], msg: str) -> Optional[str]:
 
 # synonyms -> canonical tags (khớp với DB)
 AMENITY_SYNONYMS = {
-    "nuôi thú cưng": "pet_friendly", "thú cưng": "pet_friendly", "pet": "pet_friendly",
     "máy lạnh": "air_conditioner", "may lanh": "air_conditioner",
     "máy giặt": "washing_machine", "may giat": "washing_machine",
     "nội thất": "full_furniture", "noi that": "full_furniture",
@@ -135,8 +135,6 @@ AMENITY_SYNONYMS = {
 TARGET_SYNONYMS = {
     "sinh viên": "student", "sinh vien": "student",
     "gia đình": "family", "gia dinh": "family",
-    "nữ": "female_only", "nu": "female_only",
-    "nam": "male_only"
 }
 ENV_SYNONYMS = {
     "yên tĩnh": "quiet", "yen tinh": "quiet",
@@ -171,20 +169,73 @@ def parse_rule_based(message: str) -> dict:
     }
 
 # ====== CORE ======
+CANON_AMENITIES = {"pet_friendly", "air_conditioner", "washing_machine", "full_furniture", "wifi"}
+CANON_TARGETS = {"student", "family", "female_only", "male_only"}
+CANON_ENVS = {"quiet", "secure", "near_school"}
+
+def sanitize_parsed(d: dict) -> dict:
+    """Giờ chỉ cần đảm bảo cấu trúc, không cần lọc phức tạp"""
+    out = dict(d)
+    # Đảm bảo các mảng luôn là list (không phải None)
+    out["amenities"] = d.get("amenities") or []
+    out["targets"] = d.get("targets") or []
+    out["env_types"] = d.get("env_types") or []
+    out["keywords"] = d.get("keywords") or []
+    return out
+
+
 def parse_core(message: str) -> dict:
-    # Rule-based trước (0.01–0.05s)
-    rb = parse_rule_based(message)
-    if rb.get("district") or rb.get("ward") or (rb.get("price_min") and rb.get("price_max")) or rb["amenities"] or rb["targets"] or rb["env_types"]:
-        return rb
-    # Fallback LLM (ít khi cần)
-    system = ("Bạn chỉ trích xuất JSON cho truy vấn phòng trọ Việt Nam. "
-              "Chỉ trả JSON với khóa: province,district,ward,price_min,price_max,area_min,area_max,amenities,targets,env_types,semantic_query.")
-    prompt = f'Người dùng: "{message}"\nNếu thấy "tầm/khoảng ~X triệu", suy ra ±15%.'
+    # Rule-based trước (chỉ địa lý và giá)
+    district = _find_one(DISTRICTS, message)
+    ward = _find_one(WARDS, message)
+    pmin, pmax = _parse_price(message)
+
+    # Nếu có thông tin địa lý hoặc giá, dùng luôn
+    if district or ward or (pmin and pmax):
+        return {
+            "province": None,
+            "district": district,
+            "ward": ward,
+            "price_min": pmin,
+            "price_max": pmax,
+            "area_min": None,
+            "area_max": None,
+            "amenities": [],
+            "targets": [],
+            "env_types": [],
+            "keywords": [message],
+            "semantic_query": message
+        }
+
+    # Fallback LLM cho các trường hợp phức tạp
+    system = (
+        "Bạn là một trợ lý chuyên trích xuất thông tin từ câu nói của người dùng về nhu cầu tìm nhà trọ. "
+        "Nhiệm vụ DUY NHẤT của bạn là trả về một JSON object với các khóa: "
+        "province, district, ward, price_min, price_max, area_min, area_max, "
+        "amenities, targets, env_types, keywords, semantic_query.\n\n"
+        "QUY TẮC: Chỉ trích xuất thông tin CÓ TRONG CÂU. Đối với giá cả, nếu người dùng nói 'tầm/khoảng' ~X triệu, hãy suy ra một khoảng giá hợp lý."
+    )
+    prompt = f'Người dùng: "{message}"'
     try:
         txt = ollama_generate(PARSE_MODEL, system, prompt, as_json=True, timeout=40)
-        return json.loads(txt)
+        raw = json.loads(txt)
+        return sanitize_parsed(raw)
     except Exception:
-        return rb
+        # Fallback cuối cùng
+        return {
+            "province": None,
+            "district": None,
+            "ward": None,
+            "price_min": None,
+            "price_max": None,
+            "area_min": None,
+            "area_max": None,
+            "amenities": [],
+            "targets": [],
+            "env_types": [],
+            "keywords": [message],
+            "semantic_query": message
+        }
 
 def search_core(p: Search) -> List[dict]:
     # CHỈ lấy bản ghi hiển thị
@@ -233,8 +284,6 @@ def search_core(p: Search) -> List[dict]:
     if p.area_min  is not None: where.append("bz.area >= %s"); args.append(p.area_min)
     if p.area_max  is not None: where.append("bz.area <= %s"); args.append(p.area_max)
 
-    def like_u(expr: str) -> str:
-        return f"f_unaccent({expr}) ILIKE f_unaccent(%s)"
 
     def build_name_desc_condition(keywords: list[str]) -> tuple[str, list[str]]:
         # tạo "(name ILIKE ? OR description ILIKE ?)" cho mỗi keyword
@@ -246,85 +295,46 @@ def search_core(p: Search) -> List[dict]:
 
     # --- Amenities ---
     if p.amenities:
-        exists_sql = """EXISTS (
-            SELECT 1 FROM boarding_zone_amenities a
-            WHERE a.boarding_zone_id = bz.id AND a.amenity_name = ANY(%s)
-        )"""
-        exists_args = [p.amenities]
-
-        # synonyms để tìm trong name/description
-        AMENITY_TEXT_KEYWORDS = {
-            "pet_friendly": ["nuôi thú cưng", "thú cưng", "pet"],
-            "air_conditioner": ["máy lạnh", "điều hòa"],
-            "washing_machine": ["máy giặt"],
-            "full_furniture": ["nội thất", "full nội thất"],
-            "wifi": ["wifi", "internet"]
-        }
-        kws = []
-        for tag in p.amenities:
-            kws += AMENITY_TEXT_KEYWORDS.get(tag, [])
-        kws = list({k.lower() for k in kws})
-
-        if kws:
-            text_sql, text_args = build_name_desc_condition(kws)
-            where.append(f"(({exists_sql}) OR ({text_sql}))")
-            args += exists_args + text_args
-        else:
-            where.append(exists_sql)
-            args += exists_args
+        where.append("""EXISTS (
+                    SELECT 1 FROM boarding_zone_amenities a
+                    WHERE a.boarding_zone_id = bz.id AND a.amenity_name = ANY(%s)
+                )""")
+        args.append(p.amenities)
 
     # --- Targets ---
     if p.targets:
-        exists_sql = """EXISTS (
-            SELECT 1 FROM boarding_zone_targets t
-            WHERE t.boarding_zone_id = bz.id AND t.target_group = ANY(%s)
-        )"""
-        exists_args = [p.targets]
-
-        TARGET_TEXT_KEYWORDS = {
-            "student": ["sinh viên", "sinh vien"],
-            "family": ["gia đình", "gia dinh"],
-            "female_only": ["chỉ nữ", "nữ ở"],
-            "male_only": ["chỉ nam", "nam ở"]
-        }
-        kws = []
-        for tag in p.targets:
-            kws += TARGET_TEXT_KEYWORDS.get(tag, [])
-        kws = list({k.lower() for k in kws})
-
-        if kws:
-            text_sql, text_args = build_name_desc_condition(kws)
-            where.append(f"(({exists_sql}) OR ({text_sql}))")
-            args += exists_args + text_args
-        else:
-            where.append(exists_sql)
-            args += exists_args
+        where.append("""EXISTS (
+            SELECT 1 FROM boarding_zone_targets a
+            WHERE a.boarding_zone_id = bz.id AND a.target_group = ANY(%s)
+        )""")
+        args.append(p.targets)
 
     # --- Env types ---
     if p.env_types:
-        exists_sql = """EXISTS (
-            SELECT 1 FROM boarding_zone_environment e
-            WHERE e.boarding_zone_id = bz.id AND e.environment_type = ANY(%s)
-        )"""
-        exists_args = [p.env_types]
+        where.append("""EXISTS (
+            SELECT 1 FROM boarding_zone_environment a
+            WHERE a.boarding_zone_id = bz.id AND a.environment_type = ANY(%s)
+        )""")
+        args.append(p.env_types)
 
-        ENV_TEXT_KEYWORDS = {
-            "quiet": ["yên tĩnh", "yen tinh"],
-            "secure": ["an ninh", "bảo vệ"],
-            "near_school": ["gần trường", "gan truong"]
-        }
-        kws = []
-        for tag in p.env_types:
-            kws += ENV_TEXT_KEYWORDS.get(tag, [])
-        kws = list({k.lower() for k in kws})
+    # --- Name / Description keywords ---
+    if p.keywords:
+        fts_sql = """to_tsvector('simple', f_unaccent(
+                       coalesce(bz.name,'')||' '||coalesce(bz.description,'')
+                     )) @@ plainto_tsquery('simple', f_unaccent(%s))"""
+        fts_arg = " ".join(p.keywords)
 
-        if kws:
-            text_sql, text_args = build_name_desc_condition(kws)
-            where.append(f"(({exists_sql}) OR ({text_sql}))")
-            args += exists_args + text_args
-        else:
-            where.append(exists_sql)
-            args += exists_args
+        ilike_conds, ilike_args = [], []
+        for kw in p.keywords:
+            ilike_conds.append("(" + like_u("bz.name") + " OR " + like_u("bz.description") + ")")
+            ilike_args += [f"%{kw}%"] * 2
+        ilike_sql = " OR ".join(ilike_conds)
+
+        # Gộp FTS OR ILIKE trong MỘT where-item để làm fallback mềm
+        where.append(f"(({fts_sql}) OR ({ilike_sql}))")
+        args += [fts_arg] + ilike_args
+
+
 
     base = f"""
       SELECT bz.id, bz.name, bz.expected_price, bz.area, bz.province, bz.district, bz.ward,
@@ -412,6 +422,7 @@ def chat(body: dict):
             targets=parsed.get("targets") or [],
             env_types=parsed.get("env_types") or [],
             limit=5, page=1,
+            keywords=parsed.get("keywords") or [],
             semantic_query=parsed.get("semantic_query") or msg,
         )
         items = search_core(params)

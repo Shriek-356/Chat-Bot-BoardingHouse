@@ -5,3 +5,5 @@ sentence-transformers
 numpy
 requests
 pydantic
+torch>=1.6.0
+transformers>=4.0.0
