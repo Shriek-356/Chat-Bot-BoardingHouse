@@ -1,10 +1,15 @@
-# embed_worker/worker.py
 import sys
 import psycopg
 from psycopg.rows import dict_row
 from sentence_transformers import SentenceTransformer
 
-DB_URL = "postgresql://neondb_owner:npg_LoMRfn9gqI0A@ep-noisy-darkness-a1wr0h4z-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"  # <-- đổi lại của bạn
+DB_URL = (
+    "postgresql://neondb_owner:npg_LoMRfn9gqI0A@ep-noisy-darkness-a1wr0h4z-pooler.ap-southeast-1.aws.neon.tech/neondb"
+    "?sslmode=require"
+    "&connect_timeout=15"
+    "&hostaddr=13.228.184.177"  # ép dùng IPv4 (địa chỉ bạn nhận được ở Test-NetConnection)
+    "&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
+)
 EMB_MODEL = "intfloat/multilingual-e5-small"  # 384 chiều
 BATCH = 1000  # nhúng theo lô để đỡ tốn RAM
 

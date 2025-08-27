@@ -10,11 +10,17 @@ from psycopg_pool import ConnectionPool
 from sentence_transformers import SentenceTransformer
 
 # ====== CONFIG ======
-DB_URL = os.getenv(
-    "DB_URL",
-    "postgresql://neondb_owner:npg_LoMRfn9gqI0A@ep-noisy-darkness-a1wr0h4z-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+DB_URL = (
+    "postgresql://neondb_owner:npg_LoMRfn9gqI0A@ep-noisy-darkness-a1wr0h4z-pooler.ap-southeast-1.aws.neon.tech/neondb"
+    "?sslmode=require"
+    "&connect_timeout=15"
+    "&hostaddr=13.228.184.177"
+    "&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
 )
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+
+# Ngưỡng semantic (0..1). Đặt 0.0 nếu không muốn chặn.
+SEM_MIN_SIM = float(os.getenv("SEM_MIN_SIM", "0.15"))
 
 # Dùng 1 model nhỏ cho tốc độ
 PARSE_MODEL = CHAT_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b-instruct-q4_0")
@@ -48,21 +54,23 @@ class Search(BaseModel):
     semantic_query: Optional[str] = None
 
 # ====== STARTUP ======
+PROVINCES: List[str] = []
 DISTRICTS: List[str] = []
 WARDS: List[str] = []
 
 @app.on_event("startup")
 def _setup():
-    # load từ vựng quận/phường cho parser rule-based
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS unaccent;")
+                cur.execute("SELECT DISTINCT province FROM boarding_zones WHERE province IS NOT NULL LIMIT 500")
+                globals()["PROVINCES"] = [r[0] for r in cur.fetchall()]
                 cur.execute("SELECT DISTINCT district FROM boarding_zones WHERE district IS NOT NULL LIMIT 5000")
                 globals()["DISTRICTS"] = [r[0] for r in cur.fetchall()]
                 cur.execute("SELECT DISTINCT ward FROM boarding_zones WHERE ward IS NOT NULL LIMIT 10000")
                 globals()["WARDS"] = [r[0] for r in cur.fetchall()]
-        print(f"[VOCAB] districts={len(DISTRICTS)} wards={len(WARDS)}")
+        print(f"[VOCAB] provinces={len(PROVINCES)} districts={len(DISTRICTS)} wards={len(WARDS)}")
     except Exception as e:
         print("[WARN] startup:", e)
 
@@ -89,7 +97,6 @@ def ollama_generate(model: str, system: str, prompt: str, *, as_json=False, time
 
 @lru_cache(maxsize=512)
 def embed_vec_literal(text: str) -> str:
-    """Trả literal chuỗi pgvector để bind: %s::vector"""
     vec = _embed_model.encode([text], normalize_embeddings=True)[0].tolist()
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
@@ -108,12 +115,12 @@ def _contains(term: str, text: str) -> bool:
 
 def _parse_price(msg: str):
     txt = _strip_accents(msg.lower())
-    m = re.search(r'(\d+(?:[.,]\d+)?)\s*(tr|trieu|million)', txt)  # 2.5tr / 3 triệu
+    m = re.search(r'(\d+(?:[.,]\d+)?)\s*(tr|trieu|million)', txt)
     if m:
         val = float(m.group(1).replace(",", "."))
         v = val * 1_000_000
         return max(0, v*0.85), v*1.15
-    m = re.search(r'(\d[\d .]{5,})\s*(?:d|vnd)?', txt)  # 2 500 000 / 2500000
+    m = re.search(r'(\d[\d .]{5,})\s*(?:d|vnd)?', txt)
     if m:
         v = float(re.sub(r"[ .]", "", m.group(1)))
         return max(0, v*0.85), v*1.15
@@ -125,216 +132,185 @@ def _find_one(cands: List[str], msg: str) -> Optional[str]:
             return c
     return None
 
-# synonyms -> canonical tags (khớp với DB)
-AMENITY_SYNONYMS = {
-    "máy lạnh": "air_conditioner", "may lanh": "air_conditioner",
-    "máy giặt": "washing_machine", "may giat": "washing_machine",
-    "nội thất": "full_furniture", "noi that": "full_furniture",
-    "wifi": "wifi"
-}
-TARGET_SYNONYMS = {
-    "sinh viên": "student", "sinh vien": "student",
-    "gia đình": "family", "gia dinh": "family",
-}
-ENV_SYNONYMS = {
-    "yên tĩnh": "quiet", "yen tinh": "quiet",
-    "an ninh": "secure",
-    "gần trường": "near_school", "gan truong": "near_school"
+# --- GEO NORMALIZATION ---
+GEO_PREFIX_RE = re.compile(
+    r'\b('
+    r'q\.?|quan|quận|h\.?|huyen|huyện|tp|t\.p\.?|thanh pho|thành phố|'
+    r'thi xa|tx|phuong|p\.?|phường'
+    r')\b',
+    flags=re.IGNORECASE
+)
+
+def _canon_geo(s: str) -> str:
+    s = _strip_accents((s or "").lower())
+    s = GEO_PREFIX_RE.sub(" ", s)
+    s = re.sub(r'[^a-z0-9 ]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def _find_one_geo(cands: List[str], msg: str) -> Optional[str]:
+    ms = _canon_geo(msg)
+    if not ms:
+        return None
+    for c in cands:
+        cs = _canon_geo(c or "")
+        if not cs:
+            continue
+        if cs == ms or cs in ms or ms in cs:
+            return c
+    return None
+
+# ====== CORE ======
+# Domain phrases → chỉ giữ keyword có nghĩa
+PET_SYNS = [
+    "thú cưng", "nuôi thú cưng", "cho nuôi thú cưng",
+    "pet", "pet friendly", "pet-friendly",
+    "nuôi chó", "nuôi mèo", "cho nuôi chó", "cho nuôi mèo"
+]
+AMENITY_PHRASES = [
+    "nội thất", "đầy đủ nội thất", "full nội thất", "full nt", "cơ bản nội thất",
+    "máy lạnh", "điều hòa", "máy giặt", "tủ lạnh", "bàn học", "giường", "tủ quần áo",
+    "ban công", "cửa sổ", "cửa sổ lớn", "ánh sáng tự nhiên",
+    "thang máy",
+    "gác", "gác lửng",
+    "bếp", "nấu ăn", "cho nấu ăn", "khu bếp chung",
+    "wc riêng", "toilet riêng", "nhà vệ sinh riêng",
+    "chỗ để xe", "bãi xe", "giữ xe",
+    "giờ giấc tự do", "tự do giờ giấc",
+    "ở ghép", "share phòng", "share room",
+    "gần trường", "gần đại học", "gần bệnh viện", "gần chợ", "gần bến xe"
+]
+VN_STOPWORDS = {
+    "có","nào","ở","o","cho","không","khong","tìm","tim","phòng","phong","trọ","tro",
+    "cần","can","giúp","giup","giá","gia","khoảng","khoang",
+    "quận","quan","huyện","huyen","phường","phuong","tp","t p","thanh pho","thanh","pho",
+    "tôi","toi","mình","minh","muốn","muon","cần tìm","can tim"
 }
 
-def parse_rule_based(message: str) -> dict:
-    district = _find_one(DISTRICTS, message)
-    ward     = _find_one(WARDS, message)
+def _remove_geo_from_text(msg: str) -> str:
+    ms = _canon_geo(msg)
+    for x in (PROVINCES + DISTRICTS + WARDS):
+        cx = _canon_geo(x or "")
+        if not cx:
+            continue
+        ms = re.sub(rf'\b{re.escape(cx)}\b', ' ', ms)
+    ms = re.sub(r'\s+', ' ', ms).strip()
+    return ms
+
+def _pick_phrases(msg: str, phrases: List[str]) -> List[str]:
+    s = _strip_accents(msg.lower())
+    out = []
+    for p in phrases:
+        if _strip_accents(p) in s:
+            out.append(p)
+    seen, uniq = set(), []
+    for k in out:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    return uniq
+
+def _extract_keywords(message: str) -> List[str]:
+    kws = _pick_phrases(message, PET_SYNS)
+    msg_wo_geo = _remove_geo_from_text(message)
+    kws += [k for k in _pick_phrases(msg_wo_geo, AMENITY_PHRASES) if k not in kws]
+    return kws[:3]
+
+def parse_core(message: str) -> dict:
+    province = _find_one_geo(PROVINCES, message)
+    district = _find_one_geo(DISTRICTS, message)
+    ward = _find_one_geo(WARDS, message)
     pmin, pmax = _parse_price(message)
-
-    amens = []
-    for k, canon in AMENITY_SYNONYMS.items():
-        if _contains(k, message):
-            amens.append(canon)
-    targets = [canon for k, canon in TARGET_SYNONYMS.items() if _contains(k, message)]
-    envs    = [canon for k, canon in ENV_SYNONYMS.items()    if _contains(k, message)]
+    kw = _extract_keywords(message)
 
     return {
-        "province": None,
+        "province": province,
         "district": district,
         "ward": ward,
         "price_min": pmin,
         "price_max": pmax,
         "area_min": None,
         "area_max": None,
-        "amenities": list(set(amens)),
-        "targets": list(set(targets)),
-        "env_types": list(set(envs)),
+        "amenities": [],
+        "targets": [],
+        "env_types": [],
+        "keywords": kw,
         "semantic_query": message
     }
 
-# ====== CORE ======
-CANON_AMENITIES = {"pet_friendly", "air_conditioner", "washing_machine", "full_furniture", "wifi"}
-CANON_TARGETS = {"student", "family", "female_only", "male_only"}
-CANON_ENVS = {"quiet", "secure", "near_school"}
-
-def sanitize_parsed(d: dict) -> dict:
-    """Giờ chỉ cần đảm bảo cấu trúc, không cần lọc phức tạp"""
-    out = dict(d)
-    # Đảm bảo các mảng luôn là list (không phải None)
-    out["amenities"] = d.get("amenities") or []
-    out["targets"] = d.get("targets") or []
-    out["env_types"] = d.get("env_types") or []
-    out["keywords"] = d.get("keywords") or []
-    return out
-
-
-def parse_core(message: str) -> dict:
-    # Rule-based trước (chỉ địa lý và giá)
-    district = _find_one(DISTRICTS, message)
-    ward = _find_one(WARDS, message)
-    pmin, pmax = _parse_price(message)
-
-    # Nếu có thông tin địa lý hoặc giá, dùng luôn
-    if district or ward or (pmin and pmax):
-        return {
-            "province": None,
-            "district": district,
-            "ward": ward,
-            "price_min": pmin,
-            "price_max": pmax,
-            "area_min": None,
-            "area_max": None,
-            "amenities": [],
-            "targets": [],
-            "env_types": [],
-            "keywords": [message],
-            "semantic_query": message
-        }
-
-    # Fallback LLM cho các trường hợp phức tạp
-    system = (
-        "Bạn là một trợ lý chuyên trích xuất thông tin từ câu nói của người dùng về nhu cầu tìm nhà trọ. "
-        "Nhiệm vụ DUY NHẤT của bạn là trả về một JSON object với các khóa: "
-        "province, district, ward, price_min, price_max, area_min, area_max, "
-        "amenities, targets, env_types, keywords, semantic_query.\n\n"
-        "QUY TẮC: Chỉ trích xuất thông tin CÓ TRONG CÂU. Đối với giá cả, nếu người dùng nói 'tầm/khoảng' ~X triệu, hãy suy ra một khoảng giá hợp lý."
+# Helper: canonize a SQL column (unaccent + drop geo prefixes + collapse spaces)
+def _sql_canon(col: str) -> str:
+    return (
+        "regexp_replace("
+        "  regexp_replace("
+        f"    f_unaccent({col}),"
+        "    '(\\y(q\\.?|quan|quận|h\\.?|huyen|huyện|tp|t\\.p\\.?|thanh pho|thành phố|thi xa|tx|phuong|p\\.?|phường)\\y)',"
+        "    ' ', 'gi'"
+        "  ),"
+        "  '\\s+', ' ', 'g'"
+        ")"
     )
-    prompt = f'Người dùng: "{message}"'
-    try:
-        txt = ollama_generate(PARSE_MODEL, system, prompt, as_json=True, timeout=40)
-        raw = json.loads(txt)
-        return sanitize_parsed(raw)
-    except Exception:
-        # Fallback cuối cùng
-        return {
-            "province": None,
-            "district": None,
-            "ward": None,
-            "price_min": None,
-            "price_max": None,
-            "area_min": None,
-            "area_max": None,
-            "amenities": [],
-            "targets": [],
-            "env_types": [],
-            "keywords": [message],
-            "semantic_query": message
-        }
 
 def search_core(p: Search) -> List[dict]:
-    # CHỈ lấy bản ghi hiển thị
+    # Hiển thị khoan dung: chỉ loại đúng false; true/NULL đều qua
     where = ["COALESCE(bz.is_visible, false) = false"]
     args: List = []
 
-    # ILIKE không dấu/không phân biệt hoa-thường dựa trên hàm IMMUTABLE f_unaccent(text)
-    # (xem SQL setup ở cuối file này)
     def like_u(expr: str) -> str:
         return f"f_unaccent({expr}) ILIKE f_unaccent(%s)"
 
-    # Tìm theo địa lý với fallback qua name/description/address + FTS
+    # ===== Province strict (with address fallback) =====
     if p.province:
-        where.append(like_u("bz.address"))
-        args.append(f"%{p.province}%")
+        canon = _canon_geo(p.province)
+        col_canon = _sql_canon("bz.province")
+        addr_canon = _sql_canon("bz.address")
+        strict = f"(({col_canon} <> '') AND {col_canon} ILIKE %s)"
+        fallback = f"(((bz.province IS NULL OR bz.province = '')) AND {addr_canon} ILIKE %s)"
+        where.append(f"({strict} OR {fallback})")
+        args += [f"%{canon}%", f"%{canon}%"]
 
+    # ===== District strict (with address fallback) =====
     if p.district:
-        where.append("(" + " OR ".join([
-            like_u("bz.district"),
-            like_u("bz.name"),
-            like_u("bz.description"),
-            like_u("bz.address"),
-            """to_tsvector('simple', f_unaccent(
-                   coalesce(bz.name,'')||' '||coalesce(bz.description,'')||' '||
-                   coalesce(bz.address,'')||' '||coalesce(bz.district,'')||' '||coalesce(bz.ward,'')
-               )) @@ plainto_tsquery('simple', f_unaccent(%s))"""
-        ]) + ")")
-        args += [f"%{p.district}%"] * 4 + [p.district]
+        canon = _canon_geo(p.district)
+        col_canon = _sql_canon("bz.district")
+        addr_canon = _sql_canon("bz.address")
+        strict = f"(({col_canon} <> '') AND {col_canon} ILIKE %s)"
+        fallback = f"(((bz.district IS NULL OR bz.district = '')) AND {addr_canon} ILIKE %s)"
+        where.append(f"({strict} OR {fallback})")
+        args += [f"%{canon}%", f"%{canon}%"]
 
+    # ===== Ward strict (with address fallback) =====
     if p.ward:
-        where.append("(" + " OR ".join([
-            like_u("bz.ward"),
-            like_u("bz.name"),
-            like_u("bz.description"),
-            like_u("bz.address"),
-            """to_tsvector('simple', f_unaccent(
-                   coalesce(bz.name,'')||' '||coalesce(bz.description,'')||' '||
-                   coalesce(bz.address,'')||' '||coalesce(bz.district,'')||' '||coalesce(bz.ward,'')
-               )) @@ plainto_tsquery('simple', f_unaccent(%s))"""
-        ]) + ")")
-        args += [f"%{p.ward}%"] * 4 + [p.ward]
+        canon = _canon_geo(p.ward)
+        col_canon = _sql_canon("bz.ward")
+        addr_canon = _sql_canon("bz.address")
+        strict = f"(({col_canon} <> '') AND {col_canon} ILIKE %s)"
+        fallback = f"(((bz.ward IS NULL OR bz.ward = '')) AND {addr_canon} ILIKE %s)"
+        where.append(f"({strict} OR {fallback})")
+        args += [f"%{canon}%", f"%{canon}%"]
 
     # Numeric filters
-    if p.price_min is not None: where.append("bz.expected_price >= %s"); args.append(p.price_min)
-    if p.price_max is not None: where.append("bz.expected_price <= %s"); args.append(p.price_max)
-    if p.area_min  is not None: where.append("bz.area >= %s"); args.append(p.area_min)
-    if p.area_max  is not None: where.append("bz.area <= %s"); args.append(p.area_max)
+    if p.price_min is not None:
+        where.append("bz.expected_price >= %s"); args.append(p.price_min)
+    if p.price_max is not None:
+        where.append("bz.expected_price <= %s"); args.append(p.price_max)
+    if p.area_min is not None:
+        where.append("bz.area >= %s"); args.append(p.area_min)
+    if p.area_max is not None:
+        where.append("bz.area <= %s"); args.append(p.area_max)
 
-
-    def build_name_desc_condition(keywords: list[str]) -> tuple[str, list[str]]:
-        # tạo "(name ILIKE ? OR description ILIKE ?)" cho mỗi keyword
-        conds, args_local = [], []
-        for kw in keywords:
-            conds.append("(" + like_u("bz.name") + " OR " + like_u("bz.description") + ")")
-            args_local += [f"%{kw}%"] * 2
-        return " OR ".join(conds), args_local
-
-    # --- Amenities ---
-    if p.amenities:
-        where.append("""EXISTS (
-                    SELECT 1 FROM boarding_zone_amenities a
-                    WHERE a.boarding_zone_id = bz.id AND a.amenity_name = ANY(%s)
-                )""")
-        args.append(p.amenities)
-
-    # --- Targets ---
-    if p.targets:
-        where.append("""EXISTS (
-            SELECT 1 FROM boarding_zone_targets a
-            WHERE a.boarding_zone_id = bz.id AND a.target_group = ANY(%s)
-        )""")
-        args.append(p.targets)
-
-    # --- Env types ---
-    if p.env_types:
-        where.append("""EXISTS (
-            SELECT 1 FROM boarding_zone_environment a
-            WHERE a.boarding_zone_id = bz.id AND a.environment_type = ANY(%s)
-        )""")
-        args.append(p.env_types)
-
-    # --- Name / Description keywords ---
+    # --- Name/Description keywords (AND across keywords) ---
     if p.keywords:
-        fts_sql = """to_tsvector('simple', f_unaccent(
-                       coalesce(bz.name,'')||' '||coalesce(bz.description,'')
-                     )) @@ plainto_tsquery('simple', f_unaccent(%s))"""
-        fts_arg = " ".join(p.keywords)
-
-        ilike_conds, ilike_args = [], []
         for kw in p.keywords:
-            ilike_conds.append("(" + like_u("bz.name") + " OR " + like_u("bz.description") + ")")
-            ilike_args += [f"%{kw}%"] * 2
-        ilike_sql = " OR ".join(ilike_conds)
-
-        # Gộp FTS OR ILIKE trong MỘT where-item để làm fallback mềm
-        where.append(f"(({fts_sql}) OR ({ilike_sql}))")
-        args += [fts_arg] + ilike_args
-
-
+            where.append("(" + " OR ".join([
+                """to_tsvector('simple', f_unaccent(
+                       coalesce(bz.name,'')||' '||coalesce(bz.description,'')||' '||coalesce(bz.address,'')
+                   )) @@ websearch_to_tsquery('simple', f_unaccent(%s))""",
+                like_u("bz.name"),
+                like_u("bz.description"),
+                like_u("bz.address")
+            ]) + ")")
+            args += [kw, f"%{kw}%", f"%{kw}%", f"%{kw}%"]
 
     base = f"""
       SELECT bz.id, bz.name, bz.expected_price, bz.area, bz.province, bz.district, bz.ward,
@@ -345,7 +321,6 @@ def search_core(p: Search) -> List[dict]:
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # Hybrid rank: FTS + embedding nếu có semantic_query
             if p.semantic_query:
                 qvec = embed_vec_literal(p.semantic_query)
                 try:
@@ -371,11 +346,12 @@ def search_core(p: Search) -> List[dict]:
                   JOIN boarding_zones bz ON bz.id = f.id
                 )
                 SELECT * FROM scored
+                WHERE (COALESCE(fts_score,0) > 0 OR emb_score >= %s)
                 ORDER BY (COALESCE(fts_score,0)*0.4 + COALESCE(emb_score,0)*0.6) DESC,
                          created_at DESC
                 LIMIT %s OFFSET %s
                 """
-                cur.execute(sql, args + [p.semantic_query, qvec, p.limit, (p.page - 1) * p.limit])
+                cur.execute(sql, args + [p.semantic_query, qvec, SEM_MIN_SIM, p.limit, (p.page - 1) * p.limit])
             else:
                 sql = f"{base} ORDER BY created_at DESC LIMIT %s OFFSET %s"
                 cur.execute(sql, args + [p.limit, (p.page - 1) * p.limit])
@@ -394,7 +370,6 @@ def parse(body: dict):
 @app.post("/search")
 def search(p: Search):
     t0 = time.perf_counter()
-    # mở rộng ±15% khi min==max
     pmin, pmax = widen_price(p.price_min, p.price_max)
     p = p.copy(update={"price_min": pmin, "price_max": pmax})
     items = search_core(p)
@@ -428,7 +403,6 @@ def chat(body: dict):
         items = search_core(params)
         t2 = timing("chat.search", t1)
 
-        # context ngắn để LLM trả lời nhanh
         lines = []
         for r in items:
             desc = (r.get("description") or "")[:120]
