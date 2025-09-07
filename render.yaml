@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: boarding-chatbot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /docs
+    envVars:
+      - key: DB_URL
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: LLM_MODEL
+        value: deepseek/deepseek-chat:free
+      - key: LLM_API_KEY
+        sync: false
+      - key: SEM_MIN_SIM
+        value: "0.15"
