@@ -1,6 +1,7 @@
 fastapi
 uvicorn
-psycopg[binary]
+psycopg[binary]==3.2.1
+psycopg_pool==3.2.1
 sentence-transformers
 numpy
 requests
