@@ -10,7 +10,7 @@ DB_URL = (
     "&hostaddr=13.228.184.177"  # ép dùng IPv4 (địa chỉ bạn nhận được ở Test-NetConnection)
     "&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
 )
-EMB_MODEL = "intfloat/multilingual-e5-small"  # 384 chiều
+EMB_MODEL = "intfloat/multilingual-e5-base"  # 768 chiều
 BATCH = 1000  # nhúng theo lô để đỡ tốn RAM
 
 def make_text(r: dict) -> str:
@@ -26,7 +26,7 @@ Tiện nghi: {amns}
 Môi trường: {envs}"""
 
 def main():
-    print("➡️  Connecting DB…")
+    print("Connecting DB…")
     with psycopg.connect(DB_URL) as conn, conn.cursor(row_factory=dict_row) as cur:
         # Thống kê nhanh
         cur.execute("SELECT count(*) AS total, sum((is_visible = true)::int) AS visible FROM boarding_zones;")
@@ -52,7 +52,7 @@ def main():
         rows = cur.fetchall()
         print(f"🧾 Rows to embed: {len(rows)}")
         if not rows:
-            print("⚠️  Không có bản ghi nào đủ điều kiện (có thể do is_visible=false hoặc query đang trỏ sai DB).")
+            print("⚠Không có bản ghi nào đủ điều kiện (có thể do is_visible=false hoặc query đang trỏ sai DB).")
             return
 
         model = SentenceTransformer(EMB_MODEL)
@@ -73,13 +73,13 @@ def main():
                     )
                 conn.commit()
             total += len(chunk)
-            print(f"✅ Embedded {total}/{len(rows)}")
+            print(f"Embedded {total}/{len(rows)}")
 
-    print("🎉 DONE")
+    print("DONE")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("❌ ERROR:", e)
+        print("ERROR:", e)
         sys.exit(1)
