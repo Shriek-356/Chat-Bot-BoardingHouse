@@ -86,7 +86,19 @@ def hosted_generate(system: str, prompt: str, temperature=0.25, max_tokens=500, 
 SEM_MIN_SIM = float(os.getenv("SEM_MIN_SIM", "0.15"))
 
 # Embedding model (768 chiều) — chạy local bằng SentenceTransformers
-_embed_model = SentenceTransformer("intfloat/multilingual-e5-base")
+_embed_model = None
+
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embed_model = SentenceTransformer("intfloat/multilingual-e5-base")
+    return _embed_model
+
+@lru_cache(maxsize=512)
+def embed_vec_literal(text: str) -> str:
+    vec = _get_embed_model().encode([text], normalize_embeddings=True)[0].tolist()
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 # DB pool
 pool = ConnectionPool(conninfo=DB_URL, min_size=1, max_size=10)
@@ -151,11 +163,6 @@ def timing(label: str, t0: float) -> float:
     t1 = time.perf_counter()
     print(f"[TIMING] {label}: {t1 - t0:.2f}s")
     return t1
-
-@lru_cache(maxsize=512)
-def embed_vec_literal(text: str) -> str:
-    vec = _embed_model.encode([text], normalize_embeddings=True)[0].tolist()
-    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 def widen_price(pmin: Optional[float], pmax: Optional[float]):
     if pmin is not None and pmax is not None and pmin == pmax:
