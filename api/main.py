@@ -15,7 +15,7 @@ from pathlib import Path
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 # ====== CONFIG (DB) ======
-DB_URL = (
+DB_URL = os.getenv("DB_URL") or (
     "postgresql://neondb_owner:npg_LoMRfn9gqI0A@ep-noisy-darkness-a1wr0h4z-pooler.ap-southeast-1.aws.neon.tech/neondb"
     "?sslmode=require"
     "&connect_timeout=15"
