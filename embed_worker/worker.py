@@ -10,7 +10,7 @@ DB_URL = (
     "&hostaddr=13.228.184.177"  # ép dùng IPv4 (địa chỉ bạn nhận được ở Test-NetConnection)
     "&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
 )
-EMB_MODEL = "intfloat/multilingual-e5-base"  # 768 chiều
+EMB_MODEL = "intfloat/multilingual-e5-small"  # 384 chiều
 BATCH = 1000  # nhúng theo lô để đỡ tốn RAM
 
 def make_text(r: dict) -> str:

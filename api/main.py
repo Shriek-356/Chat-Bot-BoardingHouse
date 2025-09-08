@@ -85,14 +85,13 @@ def hosted_generate(system: str, prompt: str, temperature=0.25, max_tokens=500, 
 # Ngưỡng semantic (0..1). Đặt 0.0 nếu không muốn chặn.
 SEM_MIN_SIM = float(os.getenv("SEM_MIN_SIM", "0.15"))
 
-# Embedding model (768 chiều) — chạy local bằng SentenceTransformers
 _embed_model = None
 
 def _get_embed_model():
     global _embed_model
     if _embed_model is None:
         from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer("intfloat/multilingual-e5-base")
+        _embed_model = SentenceTransformer("intfloat/multilingual-e5-small")  # 384 chiều
     return _embed_model
 
 @lru_cache(maxsize=512)
